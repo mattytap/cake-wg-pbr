@@ -25,10 +25,10 @@ To install:
   ```bash
    opkg update; opkg install tc-tiny kmod-ifb kmod-sched-core kmod-sched-cake
    cd /etc/init.d/
-   wget https://raw.githubusercontent.com/lynxthecat/cake-wg-pbr/main/cake-wg-pbr
+   wget https://raw.githubusercontent.com/mattytap/cake-wg-pbr/mattytap/cake-wg-pbr
    chmod +x ./cake-wg-pbr
    cd /etc/hotplug.d/iface/
-   wget https://raw.githubusercontent.com/lynxthecat/cake-wg-pbr/main/11-cake-wg-pbr
+   wget https://raw.githubusercontent.com/mattytap/cake-wg-pbr/mattytap/11-cake-wg-pbr
    chmod +x ./11-cake-wg-pbr
    ```
    
