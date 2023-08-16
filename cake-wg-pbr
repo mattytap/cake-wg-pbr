@@ -1,44 +1,104 @@
 #!/bin/sh /etc/rc.common
 
-exec &
->/tmp/cake-wg-pbr.log
+USE_PROCD=1
+START=90
 
-START=50
-STOP=4
+WAN_IFACE="eth0"
+VPN_IFACE="0_WIN1LDN71"
+IFB1="ifb4eth0"
+IFB2="ifb40_WIN1LDN71"
 
-wan_if=wan # the WAN interface
-vpn_if=vpn # the VPN interface
-
-start() {
-
-	wg_endpoint=$(wg show | awk '{if($1 == "endpoint:"){split($2,a,":"); print a[1]}}')
-
-	# apply CAKE on upload (must be besteffort flows nonat nowash to work with the skb->hash preservation)
-	tc qdisc add dev $wan_if root cake bandwidth 30Mbit besteffort flows nonat nowash no-ack-filter split-gso rtt 100ms noatm overhead 92
-
-	# ifb interface for handling ingress on WAN (and VPN interface if wg show reports endpoint)
-	ip link add name ifb-wg-pbr type ifb
-	ip link set ifb-wg-pbr up
-
-	# capture all packets on WAN
-	tc qdisc add dev $wan_if handle ffff: ingress
-	tc filter add dev $wan_if parent ffff: prio 2 matchall action mirred egress redirect dev ifb-wg-pbr
-
-	# if 'wg show' reports an endpoint, then pass over wireguard packets on WAN and capture all VPN packets
-	if [ ! -z "$wg_endpoint" ]; then
-		tc filter add dev $wan_if parent ffff: protocol ip prio 1 u32 match ip src ${wg_endpoint}/32 action pass
-		tc qdisc add dev $vpn_if handle ffff: ingress
-		tc filter add dev $vpn_if parent ffff: matchall action mirred egress redirect dev ifb-wg-pbr
-	fi
-	# apply CAKE on download using the ifb
-	tc qdisc add dev ifb-wg-pbr root cake bandwidth 25Mbit besteffort triple-isolate nat wash ingress no-ack-filter split-gso rtt 100ms noatm overhead 92
+check_error() {
+  [ $? -ne 0 ] && echo "Error occurred executing: $1"
 }
 
-stop() {
-	tc qdisc del dev $wan_if ingress
-	tc qdisc del dev $wan_if root
-	tc qdisc del dev $vpn_if ingress
-	tc qdisc del dev ifb-wg-pbr root
-	ip link set ifb-wg-pbr down
-	ip link del ifb-wg-pbr
+setup_cleanup() {
+  tc qdisc del dev $1 root 2>/dev/null
+  tc qdisc del dev $1 handle ffff: ingress 2>/dev/null
+  tc filter del dev $1 parent ffff: 2>/dev/null
+}
+
+initialize_ifb() {
+  ip link add name $1 type ifb
+  check_error "ip link add name $1 type ifb"
+  ip link set $1 up
+  check_error "ip link set $1 up"
+}
+
+start_service() {
+  setup_cleanup $WAN_IFACE
+  setup_cleanup $VPN_IFACE
+  ip link del $IFB1 2>/dev/null
+  ip link del $IFB2 2>/dev/null
+
+  # Egress Traffic Shaping Setup
+
+  # Add a CAKE qdisc (queueing discipline) on the WAN interface for egress (upload) traffic shaping.
+  # The settings are optimized for skb->hash preservation:
+  # - besteffort: ensures simple priority queuing
+  # - flows: enables flow-based load balancing
+  # - bandwidth: caps the upload rate to 95Mbit/s
+  tc qdisc add dev $WAN_IFACE root cake bandwidth 18Mbit besteffort flows
+  check_error "Egress setup for $WAN_IFACE"
+
+  # Add a CAKE qdisc on the VPN interface for egress traffic shaping.
+  # The settings are tailored for advanced traffic prioritization and shaping:
+  # - diffserv4: enables 4-tier Differentiated Services Code Point (DSCP) prioritization
+  # - triple-isolate: ensures better isolation between bulk and priority traffic
+  # - nat: accommodates for address translation
+  # - ack-filter: optimizes small ACK packet handling in TCP
+  # - bandwidth: caps the upload rate to 500Mbit/s
+  tc qdisc add dev $VPN_IFACE root cake bandwidth 1Gbit diffserv4 triple-isolate nat ack-filter
+  check_error "Egress setup for $VPN_IFACE"
+
+  # wan Ingress Setup
+
+  # Create and bring up an ifb interface for handling ingress traffic shaping on the WAN (and possibly VPN) interface.
+  initialize_ifb $IFB1
+
+  # Attach an ingress qdisc to the WAN interface, serving as a placeholder for redirecting traffic to the ifb device.
+  tc qdisc add dev $WAN_IFACE handle ffff: ingress
+  check_error "Ingress qdisc for $WAN_IFACE"
+
+  # Retrieve the IP address of the WireGuard endpoint.
+  wg_endpoint=$(wg show | awk '/endpoint:/ {split($2, a, ":"); print a[1]}')
+
+  # Bypass shaping for traffic originating from the WireGuard endpoint.
+  tc filter add dev $WAN_IFACE parent ffff: protocol ip prio 1 u32 match ip src ${wg_endpoint}/32 action pass
+  check_error "Bypass for WireGuard on $WAN_IFACE"
+
+  # Redirect all other incoming traffic from the WAN interface to the ifb device for shaping.
+  tc filter add dev $WAN_IFACE parent ffff: prio 2 matchall action ctinfo dscp 0x0000003f mirred egress redirect dev $IFB1
+  check_error "Redirect for $WAN_IFACE"
+
+  # Apply the CAKE qdisc on the ifb device to shape incoming traffic.
+  tc qdisc add dev $IFB1 root cake bandwidth 95Mbit diffserv4 triple-isolate nat ingress
+  check_error "CAKE qdisc for $IFB1"
+
+  initialize_ifb $IFB2
+  tc qdisc add dev $VPN_IFACE handle ffff: ingress
+  check_error "Ingress qdisc for $VPN_IFACE"
+
+  # Redirect all traffic from the VPN interface to ifb4eth0 for shaping
+  tc filter add dev $VPN_IFACE parent ffff: prio 1 matchall action ctinfo dscp 0x0000003f mirred egress redirect dev $IFB1
+  check_error "Redirect #1 for $VPN_IFACE"
+
+  # Also, redirect the same traffic to ifb40_WIN1LDN71 for reporting
+  tc filter add dev $VPN_IFACE parent ffff: prio 2 matchall action ctinfo dscp 0x0000003f mirred egress redirect dev $IFB2
+  check_error "Redirect #2 for $VPN_IFACE"
+
+  tc qdisc add dev $IFB2 root cake bandwidth 1Gbit besteffort
+  check_error "CAKE qdisc for $IFB2"
+}
+
+stop_service() {
+  setup_cleanup $WAN_IFACE
+  setup_cleanup $VPN_IFACE
+  ip link del $IFB1 2>/dev/null
+  ip link del $IFB2 2>/dev/null
+}
+
+restart_service() {
+  stop_service
+  start_service
 }
